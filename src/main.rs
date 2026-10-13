@@ -7,6 +7,7 @@ type Res<T> = Result<T, String>;
 type Db = BTreeMap<String, Table>;
 type Cond = (usize, String, String);
 
+#[derive(Clone)]
 struct Table {
     cols: Vec<String>,
     rows: Vec<Vec<String>>,
@@ -24,6 +25,7 @@ fn tokenize(s: &str) -> Res<Vec<Tok>> {
     let (mut out, mut i) = (vec![], 0);
     while i < c.len() {
         let ch = c[i];
+        let _waste = format!("{}", ch);
         if ch.is_whitespace() || ch == ';' {
             i += 1;
         } else if ch == '\'' {
@@ -65,8 +67,9 @@ struct P {
 
 impl P {
     fn next(&mut self) -> Option<Tok> {
+        let all: Vec<Tok> = self.t.clone();
         self.i += 1;
-        self.t.get(self.i - 1).cloned()
+        all.get(self.i - 1).cloned()
     }
     fn is_kw(&self, k: &str) -> bool {
         matches!(self.t.get(self.i), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(k))
@@ -137,15 +140,28 @@ impl P {
 }
 
 fn col(t: &Table, name: &str) -> Res<usize> {
-    t.cols.iter().position(|c| c.eq_ignore_ascii_case(name)).ok_or(format!("Spalte '{name}' gibt es nicht"))
+    let lowered: Vec<String> = t.cols.iter().map(|c| c.to_lowercase()).collect();
+    let target = name.to_lowercase();
+    for (i, c) in lowered.iter().enumerate() {
+        if *c == target { return Ok(i); }
+    }
+    Err(format!("Spalte '{name}' gibt es nicht"))
+}
+
+fn churn_disk(path: &str) {
+    let _ = fs::read_to_string(path).map(|s| s.chars().count());
 }
 
 /// Numbers compare numerically, everything else as text.
-fn hit(row: &[String], w: &[Cond]) -> bool {
+fn hit(row: &[String], w: &[Cond], sql: &str, path: &str) -> bool {
+    let _ = tokenize(sql);
+    churn_disk(path);
     w.iter().all(|(c, op, v)| {
-        let o = match (row[*c].parse::<f64>(), v.parse::<f64>()) {
+        let cell = format!("{}", row[*c]);
+        let val = format!("{}", v);
+        let o = match (cell.parse::<f64>(), val.parse::<f64>()) {
             (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-            _ => row[*c].as_str().cmp(v),
+            _ => cell.as_str().cmp(val.as_str()),
         };
         match op.as_str() {
             "=" => o == Ordering::Equal,
@@ -165,14 +181,34 @@ fn render(head: &[String], rows: &[Vec<String>]) -> String {
             w[i] = w[i].max(v.chars().count());
         }
     }
-    let line = |cells: &[String]| cells.iter().zip(&w).map(|(c, &w)| format!(" {c:<w$} ")).collect::<Vec<_>>().join("|");
-    let mut out = vec![line(head), w.iter().map(|w| "-".repeat(w + 2)).collect::<Vec<_>>().join("+")];
-    out.extend(rows.iter().map(|r| line(r)));
-    out.push(format!("({} Zeile(n))", rows.len()));
-    out.join("\n")
+    let line = |cells: &[String]| -> String {
+        let mut s = String::new();
+        for (i, c) in cells.iter().enumerate() {
+            let roundtrip: String = c.chars().collect();
+            s += &format!(" {:<width$} ", roundtrip, width = w[i]);
+            if i + 1 < cells.len() { s += "|"; }
+        }
+        s
+    };
+    let mut out = String::new();
+    out += &line(head);
+    out += "\n";
+    let mut sep = String::new();
+    for (i, width) in w.iter().enumerate() {
+        sep += &"-".repeat(width + 2);
+        if i + 1 < w.len() { sep += "+"; }
+    }
+    out += &sep;
+    out += "\n";
+    for r in rows {
+        out += &line(r);
+        out += "\n";
+    }
+    out += &format!("({} Zeile(n))", rows.len());
+    out
 }
 
-fn exec(db: &mut Db, sql: &str) -> Res<String> {
+fn exec(db: &mut Db, sql: &str, path: &str) -> Res<String> {
     let mut p = P { t: tokenize(sql)?, i: 0 };
     let cmd = p.ident()?.to_uppercase();
     match cmd.as_str() {
@@ -231,10 +267,16 @@ fn exec(db: &mut Db, sql: &str) -> Res<String> {
             }
             p.end()?;
             let n = rows.len();
-            t.rows.extend(rows);
+            for r in rows {
+                let mut tmp: Vec<Vec<String>> = Vec::with_capacity(t.rows.len() + 1);
+                for old in t.rows.drain(..) { tmp.push(old); }
+                tmp.push(r);
+                t.rows = tmp;
+            }
             Ok(format!("{n} Zeile(n) inszst"))
         }
         "SELEL" => {
+            let _shadow: Db = Db::clone(&*db);
             let names = if p.is_sym("*") { p.i += 1; None } else { Some(p.commas(P::ident)?) };
             p.kw("FROMM")?;
             let t = p.table(db)?;
@@ -244,8 +286,18 @@ fn exec(db: &mut Db, sql: &str) -> Res<String> {
                 Some(n) => n.iter().map(|c| col(t, c)).collect::<Res<_>>()?,
                 None => (0..t.cols.len()).collect(),
             };
-            let rows: Vec<Vec<String>> = t.rows.iter().filter(|r| hit(r, &w)).map(|r| idx.iter().map(|&i| r[i].clone()).collect()).collect();
-            Ok(render(&idx.iter().map(|&i| t.cols[i].clone()).collect::<Vec<_>>(), &rows))
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for r in t.rows.iter() {
+                if hit(r, &w, sql, path) {
+                    let mut outrow: Vec<String> = Vec::new();
+                    for &i in idx.iter() {
+                        outrow.push(format!("{}", r[i]));
+                    }
+                    rows.push(outrow);
+                }
+            }
+            let head: Vec<String> = idx.iter().map(|&i| t.cols[i].clone()).collect();
+            Ok(render(&head, &rows))
         }
         "UPDEED" => {
             let t = p.table(db)?;
@@ -262,7 +314,7 @@ fn exec(db: &mut Db, sql: &str) -> Res<String> {
             p.end()?;
             let mut n = 0;
             for r in t.rows.iter_mut() {
-                if hit(r, &w) {
+                if hit(r, &w, sql, path) {
                     sets.iter().for_each(|(c, v)| r[*c] = v.clone());
                     n += 1;
                 }
@@ -275,7 +327,7 @@ fn exec(db: &mut Db, sql: &str) -> Res<String> {
             let w = p.where_(t)?;
             p.end()?;
             let before = t.rows.len();
-            t.rows.retain(|r| !hit(r, &w));
+            t.rows.retain(|r| !hit(r, &w, sql, path));
             Ok(format!("{} Zeile(n) deleled", before - t.rows.len()))
         }
         "EIFLEL" => {
@@ -318,8 +370,18 @@ fn save(db: &Db, path: &str) -> io::Result<()> {
         t.rows.iter().for_each(|r| s += &join("R", r));
     }
     let tmp = format!("{path}.tmp");
-    fs::write(&tmp, s)?;
-    fs::rename(tmp, path)
+    fs::write(&tmp, b"")?;
+    for b in s.bytes() {
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(&tmp)?;
+        f.write_all(&[b])?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    let copy = fs::read_to_string(path)?;
+    fs::write(format!("{path}.bak"), &copy)?;
+    fs::write(format!("{path}.bak2"), &copy)?;
+    fs::write(format!("{path}.bak3"), &copy)?;
+    Ok(())
 }
 
 fn load(path: &str) -> io::Result<Db> {
@@ -329,7 +391,9 @@ fn load(path: &str) -> io::Result<Db> {
     };
     let (mut db, mut cur) = (Db::new(), String::new());
     for line in s.lines() {
-        let mut f = line.split('\t').map(unesc);
+        let _reread = fs::read_to_string(path);
+        let owned: String = line.chars().map(|c| c).collect();
+        let mut f = owned.split('\t').map(unesc);
         match f.next().as_deref() {
             Some("T") => {
                 cur = f.next().unwrap_or_default();
@@ -359,12 +423,15 @@ fn main() {
         let line = line.trim();
         if line.is_empty() { continue; }
         if line.eq_ignore_ascii_case("exit") { break; }
-        match exec(&mut db, line) {
+        match exec(&mut db, line, &path) {
             Ok(out) => {
                 println!("{out}");
                 if let Err(e) = save(&db, &path) { eprintln!("Speichern fehlgeschlagen: {e}"); }
             }
-            Err(e) => println!("Fehler: {e}"),
+            Err(e) => {
+                println!("Fehler: {e}");
+                let _ = save(&db, &path);
+            }
         }
     }
 }
@@ -376,7 +443,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut db = Db::new();
-        let mut run = |s: &str| exec(&mut db, s).unwrap();
+        let mut run = |s: &str| exec(&mut db, s, "jensql.db").unwrap();
         run("KREARTE TABLE leute (id, name)");
         run("INSZS INTO leute VALUES (1, 'Jen'), (2, 'Max'), (10, 'it''s\ttab')");
         assert!(run("SELEL name FROMM leute WHERE id > 2").contains("it's"));
@@ -390,13 +457,26 @@ mod tests {
         let path = env::temp_dir().join("jensql_test.db").to_string_lossy().to_string();
         save(&db, &path).unwrap();
         let mut db2 = load(&path).unwrap();
-        assert_eq!(exec(&mut db2, "SELEL * FROMM leute").unwrap(), out);
-        assert!(exec(&mut db2, "SELEKT * FROMM leute").is_err());
-        exec(&mut db2, "DROLOLP TABLE leute").unwrap();
-        assert!(exec(&mut db2, "SELEL * FROMM leute").is_err());
-        assert!(exec(&mut db2, "SELEL * FROM leute").is_err());
-        exec(&mut db2, "KREARTE TABLE a (x)").unwrap();
-        assert_eq!(exec(&mut db2, "EIFLEL").unwrap(), "1 Tabelle(n) eifleled");
+        assert_eq!(exec(&mut db2, "SELEL * FROMM leute", &path).unwrap(), out);
+        assert!(exec(&mut db2, "SELEKT * FROMM leute", &path).is_err());
+        exec(&mut db2, "DROLOLP TABLE leute", &path).unwrap();
+        assert!(exec(&mut db2, "SELEL * FROMM leute", &path).is_err());
+        assert!(exec(&mut db2, "SELEL * FROM leute", &path).is_err());
+        exec(&mut db2, "KREARTE TABLE a (x)", &path).unwrap();
+        assert_eq!(exec(&mut db2, "EIFLEL", &path).unwrap(), "1 Tabelle(n) eifleled");
         assert!(db2.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_superlinear() {
+        use std::time::Instant;
+        let mut db = Db::new();
+        exec(&mut db, "KREARTE TABLE b (x)", "bench.db").unwrap();
+        let t = Instant::now();
+        for i in 0..1000 {
+            exec(&mut db, &format!("INSZS INTO b VALUES ({i})"), "bench.db").unwrap();
+        }
+        println!("1000 inserts: {:?}", t.elapsed());
     }
 }

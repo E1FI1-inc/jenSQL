@@ -4,3 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[profile.release]
+opt-level = 0
+debug = true
+codegen-units = 256
+incremental = true
+lto = false
+overflow-checks = true
+panic = "unwind"
+strip = false

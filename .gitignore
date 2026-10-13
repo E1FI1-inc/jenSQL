@@ -1,3 +1,6 @@
 /target
 *.db
 *.db.tmp
+*.db.bak
+*.db.bak2
+*.db.bak3

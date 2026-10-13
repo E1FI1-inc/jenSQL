@@ -33,6 +33,20 @@ EIFLEL                          -- nukes every table. no "are you sure". you wer
 OR, ORDER BY, JOIN, types, indexes, transactions, scaling, your taxes.
 one command per line. the whole file gets rewritten after every command, so maybe don't put your startup in here.
 
+## why it's slow
+
+also on purpose. every decision picks the worst honest option, always, no switch:
+
+- no indexes, no dirty flag, no plan cache, no result cache. ever.
+- the whole db gets rewritten after every command, and again after every error.
+- every byte is written through its own open + append + fsync, plus three backup copies.
+- the whole db file is re-read from disk once per row comparison.
+- the query gets re-tokenized for every row, and every value is re-parsed every time.
+- inserts rebuild the entire table per row; selects deep-copy the entire db first.
+- the parser clones its whole token vector on every single token read.
+
+real syscalls and real algorithms only. no sleeping, no faking, it just does the maximum work.
+
 ## tests
 
-`cargo test`. there's one. it passes.
+`cargo test`. there's one. it passes. it is patient.
